@@ -1,290 +1,309 @@
-from classifiers_util import *
+# -*- coding: utf-8 -*-
+"""
+Train the LSTM pulse-number classifier on the same 2D SVD h5 files as
+train_how_many.py so the two models can be compared head-to-head.
+
+Reads `Ypdf` (16x512) from each h5 group, transposes to (512, 16) so the LSTM
+sees a 512-step time series of 16-dim vectors, and remaps npulses to
+0..(max_pulses - min_pulses).
+
+Emits the same 3-panel training-curve PNG (CE loss / MSE / accuracy) that
+train_how_many.py produces, into --figures_dir.
+"""
+
+import os
+import copy
+import argparse
+import time
+
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
 from lstm_pulseNum_classifier import CustomLSTMClassifier
-# Get the directory of the currently running file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Construct the path to the utils directory relative to the current file's directory
-utils_dir = os.path.abspath(os.path.join(current_dir, '../..', 'ml_backbone'))
-denoise_dir = os.path.abspath(os.path.join(current_dir, '../..', 'denoising'))
-
-sys.path.append(utils_dir)
-sys.path.append(denoise_dir)
 
 
-from ximg_to_ypdf_autoencoder import Ximg_to_Ypdf_Autoencoder, Zero_PulseClassifier
-from utils import DataMilking_Nonfat, DataMilking, DataMilking_SemiSkimmed, DataMilking_HalfAndHalf, DataMilking_MilkCurds
-from utils import CustomScheduler
+def load_h5_for_lstm(paths, input_key, min_pulses, max_pulses):
+    """Preload every h5 group whose npulses is in [min_pulses, max_pulses].
+    Returns (TensorDataset(x, y), seq_len, feat_dim, num_classes).
 
-# Check if CUDA (GPU support) is available
-if torch.cuda.is_available():
-    print("GPU is available!")
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    device = torch.device("mps")
-    print("MPS is available. Using GPU.")
-else:
-    device = torch.device("cpu")
-    print("MPS is not available. Using CPU.")
-# device = torch.device("cpu")
+    Inputs are shaped (seq_len=16, feat_dim=512) — 16 detector-angle steps of
+    512-bin spectra, matching the original repo's LSTM setup.
+    Labels are integer classes 0..(max-min) (CrossEntropyLoss compatible).
+    """
+    files = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isfile(p) and p.endswith(".h5"):
+            files.append(p)
+        elif os.path.isdir(p):
+            files.extend(
+                os.path.join(p, n) for n in sorted(os.listdir(p)) if n.endswith(".h5")
+            )
+        else:
+            raise FileNotFoundError(f"Not an .h5 file or directory: {p}")
+    if not files:
+        raise RuntimeError(f"No .h5 files found under {paths}")
+
+    inputs, labels = [], []
+    for path in files:
+        print(f"lstm: reading {path}")
+        with h5py.File(path, "r") as f:
+            for shot in f.keys():
+                grp = f[shot]
+                n = int(grp.attrs["npulses"])
+                if n < min_pulses or n > max_pulses:
+                    continue
+                arr = np.asarray(grp[input_key][()], dtype=np.float32)
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"{path}:{shot} {input_key} has shape {arr.shape}, expected 2D"
+                    )
+                # Ximg/Ypdf are (16, 512). Feed the LSTM as
+                # (seq_len=16, feat_dim=512): 16 detector-angle steps of
+                # 512-bin spectra, matching the original repo's LSTM setup.
+                if arr.shape[0] > arr.shape[1]:
+                    arr = arr.T
+                inputs.append(arr)
+                labels.append(n - min_pulses)
+    if not inputs:
+        raise RuntimeError(
+            f"No shots with npulses in [{min_pulses}, {max_pulses}] in {files}"
+        )
+
+    x = torch.from_numpy(np.stack(inputs))
+    y = torch.tensor(labels, dtype=torch.long)
+    seq_len, feat_dim = x.shape[1], x.shape[2]
+    num_classes = max_pulses - min_pulses + 1
+    print(
+        f"lstm: loaded {len(y)} shots, input_key={input_key}, "
+        f"shape=(seq_len={seq_len}, feat_dim={feat_dim}), "
+        f"classes={num_classes} (npulses {min_pulses}..{max_pulses})"
+    )
+    return TensorDataset(x, y), seq_len, feat_dim, num_classes
+
+
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float("inf")
+        self.early_stop = False
+        self.best_weights = None
+
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            self.best_weights = copy.deepcopy(model.state_dict())
+        else:
+            self.counter += 1
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+
+def mse_metric(logits, labels):
+    probs = torch.softmax(logits, dim=1)
+    one_hot = F.one_hot(labels, num_classes=logits.size(1)).float()
+    return F.mse_loss(probs, one_hot, reduction="mean")
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+    running_mse = 0.0
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x, y = x.to(device, torch.float32), y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        running_mse += mse_metric(logits, y).item()
+        preds = logits.argmax(dim=1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+    return running_loss / len(loader), running_mse / len(loader), 100.0 * correct / total
+
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    running_mse = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device, torch.float32), y.to(device)
+            logits = model(x)
+            running_loss += criterion(logits, y).item()
+            running_mse += mse_metric(logits, y).item()
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    return running_loss / len(loader), running_mse / len(loader), 100.0 * correct / total
+
+
 def main():
-    seed = 42
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # Input Data Paths and Output Save Paths
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dirs", type=str, required=True,
+                        help="':'-separated list of h5 files or directories.")
+    parser.add_argument("--input_key", type=str, default="Ypdf")
+    parser.add_argument("--min_pulses", type=int, default=1)
+    parser.add_argument("--max_pulses", type=int, default=4)
+    parser.add_argument("--val_frac", type=float, default=0.2)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--num_lstm_layers", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--lstm_dropout", type=float, default=0.2)
+    parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--save_model", type=str, default=None,
+                        help="Filename (relative to --save_dir) for the .pth.")
+    parser.add_argument("--figures_dir", type=str, default=None,
+                        help="Directory for the training-curve PNG. "
+                             "Defaults to ./figures/ next to this file.")
+    args = parser.parse_args()
 
-    # Load Dataset and Feed to Dataloader
-    # datapath = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    datapath1 = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_06252024/"
-    datapath2 = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_06252024/"
-    datapath_train = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024_0to1/train/"
-    datapath_train = "/sdf/scratch/lcls/ds/prj/prjs2e21/scratch/fast_data_access/even-dist_Pulses_03302024/Processed_07262024_0to1/train/"
-    # datapath_val = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024/val/"
-    pulse_specification = None
+    torch.manual_seed(42)
+    np.random.seed(42)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # data = DataMilking_Nonfat(root_dir=datapath, pulse_number=2, subset=4)
-    # data = DataMilking_SemiSkimmed(root_dir=datapath, pulse_number=1, input_name="Ximg", labels=["Ypdf"])
-    # data_train = DataMilking_MilkCurds(root_dirs=[datapath_train], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, test_batch=5, zero_to_one_rescale=True)
-    # data_train = DataMilking_MilkCurds(root_dirs=[datapath_train], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, zero_to_one_rescale=False)
-    # data_train = DataMilking_MilkCurds(root_dirs=[datapath_train], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, zero_to_one_rescale=False)
-    data_train_2 = DataMilking_MilkCurds(root_dirs=[datapath_train], input_name="Ximg", pulse_handler=None, transform=None, pulse_threshold=4, zero_to_one_rescale=False)
-    data_train = data_train_2
-    # data_val = DataMilking_MilkCurds(root_dirs=[datapath_val], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, test_batch=3)
-
-    print(len(data_train))
-    # Calculate the lengths for each split
-    train_size = int(0.8 * len(data_train))
-    val_size = int(0.2 * len(data_train))
-    test_size = len(data_train) - train_size - val_size
-    #print sizes of train, val, and test
-    print(f"Train size: {train_size}")
-    print(f"Validation size: {val_size}")
-    print(f"Test size: {test_size}")
-
-    # Perform the split
-    train_dataset, val_dataset, test_dataset = random_split(data_train, [train_size, val_size, test_size])
-    # train_dataset_2, val_dataset_2, test_dataset_2 = random_split(data_train_2, [train_size, val_size, test_size])
-
-
-
-    # Create data loaders
-    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-    # train_dataloader_2 = DataLoader(train_dataset_2, batch_size=32, shuffle=True)
-    # val_dataloader_2 = DataLoader(val_dataset_2, batch_size=32, shuffle=False)
-    # test_dataloader_2 = DataLoader(test_dataset_2, batch_size=32, shuffle=False)
-
-
-    # Define the model
-    # Create CustomLSTMClassifier model
-    data = {
-        "hidden_size": 128,
-        "num_lstm_layers": 3,
-        "bidirectional": True,
-        "fc_layers": [32, 64],
-        "dropout": 0.2,
-        "lstm_dropout": 0.2,
-        "layerNorm": False,
-        # Other parameters are default or not provided in the example
-    }   
-
-    # Assuming input_size and num_classes are defined elsewhere
-    input_size = 512  # Define your input size
-    num_classes = 5   # Example number of classes
-
-    # Instantiate the CustomLSTMClassifier
-    classModel = CustomLSTMClassifier(
-        input_size=input_size,
-        hidden_size=data['hidden_size'],
-        num_lstm_layers=data['num_lstm_layers'],
-        num_classes=num_classes,
-        bidirectional=data['bidirectional'],
-        fc_layers=data['fc_layers'],
-        dropout_p=data['dropout'],
-        lstm_dropout=data['lstm_dropout'],
-        layer_norm=data['layerNorm'],
-        ignore_output_layer=False  # Set as needed based on your application
+    data_paths = [d for d in args.data_dirs.split(":") if d]
+    dataset, seq_len, feat_dim, num_classes = load_h5_for_lstm(
+        data_paths, args.input_key, args.min_pulses, args.max_pulses,
     )
 
-    # Define the loss function and optimizer
+    val_size = int(args.val_frac * len(dataset))
+    train_size = len(dataset) - val_size
+    print(f"Train size: {train_size}, Val size: {val_size}")
+    train_dataset, val_dataset = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                              shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                            shuffle=False, num_workers=args.num_workers)
+
+    model = CustomLSTMClassifier(
+        input_size=feat_dim,
+        hidden_size=args.hidden_size,
+        num_lstm_layers=args.num_lstm_layers,
+        num_classes=num_classes,
+        bidirectional=True,
+        fc_layers=[32, 64],
+        dropout_p=args.dropout,
+        lstm_dropout=args.lstm_dropout,
+        layer_norm=False,
+        ignore_output_layer=False,
+    ).to(device)
+
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(classModel.parameters(), lr=0.0001)
-    max_epochs = 200
-    scheduler = CustomScheduler(optimizer, patience=3, early_stop_patience = 10, cooldown=2, lr_reduction_factor=0.5, max_num_epochs = max_epochs, improvement_percentage=0.001)
-    # model_save_dir = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    # model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_07302024_ypdf_0to1_test3/"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_073312024_5classCase/"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_09042024_5classCase/"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_09052024_5classCase/"
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    early_stopping = EarlyStopping(patience=args.patience)
+
+    train_losses, train_accs, train_mses = [], [], []
+    val_losses, val_accs, val_mses = [], [], []
+    actual_epochs = 0
+
+    start_time = time.time()
+    print("Training the LSTM pulse-number classifier...")
+    for epoch in range(args.epochs):
+        actual_epochs += 1
+        tl, tm, ta = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        vl, vm, va = evaluate(model, val_loader, criterion, device)
+
+        train_losses.append(tl); train_mses.append(tm); train_accs.append(ta)
+        val_losses.append(vl);   val_mses.append(vm);   val_accs.append(va)
+
+        print(f"Epoch [{epoch+1}/{args.epochs}] "
+              f"| Train Loss: {tl:.4f}, MSE: {tm:.4f}, Acc: {ta:.2f}% "
+              f"| Val Loss: {vl:.4f}, MSE: {vm:.4f}, Acc: {va:.2f}%")
+
+        early_stopping(vl, model)
+        if early_stopping.early_stop:
+            print("Early stopping triggered! Cutting training short.")
+            break
+
+    if early_stopping.best_weights is not None:
+        model.load_state_dict(early_stopping.best_weights)
+        print(f"Rolled back to best weights (Best Val Loss: {early_stopping.best_loss:.4f})")
+
+    print(f"Training time: {time.time() - start_time:.2f}s")
+
+    if args.save_model is not None:
+        save_dir = args.save_dir or os.getcwd()
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, args.save_model)
+        torch.save({
+            "state_dict": model.state_dict(),
+            "seq_len": seq_len,
+            "feat_dim": feat_dim,
+            "num_classes": num_classes,
+            "min_pulses": args.min_pulses,
+            "max_pulses": args.max_pulses,
+            "input_key": args.input_key,
+            "hidden_size": args.hidden_size,
+            "num_lstm_layers": args.num_lstm_layers,
+            "dropout": args.dropout,
+            "lstm_dropout": args.lstm_dropout,
+        }, save_path)
+        print(f"Best model saved to {save_path}")
+
+    # --------------------------------------------------------------------
+    # 3-panel training curve (same layout as train_how_many.py)
+    # --------------------------------------------------------------------
+    epochs_range = range(1, actual_epochs + 1)
+    plt.figure(figsize=(12, 5))
+    plt.suptitle(
+        f"LSTM Pulse-Number Classifier | input_key={args.input_key} "
+        f"| classes {args.min_pulses}..{args.max_pulses}",
+        fontsize=14,
+    )
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs_range, train_losses, label="Train")
+    plt.plot(epochs_range, val_losses, label="Val")
+    plt.title("CE Loss"); plt.xlabel("Epoch"); plt.legend()
+
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs_range, train_mses, label="Train")
+    plt.plot(epochs_range, val_mses, label="Val")
+    plt.title("MSE"); plt.xlabel("Epoch"); plt.legend()
+
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs_range, train_accs, label="Train")
+    plt.plot(epochs_range, val_accs, label="Val")
+    plt.title("Accuracy (%)"); plt.xlabel("Epoch"); plt.legend()
+
+    plt.tight_layout()
+
+    if args.save_model is not None:
+        figures_dir = args.figures_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "figures"
+        )
+        os.makedirs(figures_dir, exist_ok=True)
+        fig_path = os.path.join(figures_dir, f"training_data_for_{args.save_model}.png")
+        plt.savefig(fig_path)
+        print(f"Figure saved to {fig_path}")
 
 
-    # Check if directory exists, otherwise create it
-    if not os.path.exists(model_save_dir):
-        os.makedirs(model_save_dir)
-
-
-
-
-    # best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_06272024_singlePulse/testAutoencoder_best_model.pth"
-    # best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07042024_zeroPredict/classifier_best_model.pth"
-    # best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_singlePulse_2/autoencoder_best_model.pth"
-    best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09032024_multiPulse_final/autoencoder_5_best_model.pth"
-    best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09042024_multiPulse_final/autoencoder_6_best_model.pth"
-    # best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_singlePulse_2/autoencoder_best_model.pth"
-
-    best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_zeroPredict/classifier_best_model.pth"
-    # Example usage
-    encoder_layers = np.array([
-        [nn.Conv2d(1, 16, kernel_size=3, padding=2), nn.ReLU()],
-        [nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU()]])
-   
-    # decoder_layers = np.array([
-    #     [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Tanh()]  # Example with Sigmoid activation
-    #     # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
-    # ])
-    decoder_layers = np.array([
-        [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Sigmoid()]  # Example with Sigmoid activation
-        # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
-    ])
-    
-    autoencoder = Ximg_to_Ypdf_Autoencoder(encoder_layers, decoder_layers)
-
-    # Example usage
-    conv_layers = [
-        [nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None],
-        [nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None]
-    ]
-
-    # Calculate the output size after conv layers
-    def get_conv_output_size(input_size, conv_layers):
-        x = torch.randn(input_size)
-        model = nn.Sequential(*[layer for layer_pair in conv_layers for layer in layer_pair if layer is not None])
-        x = model(x)
-        return x.shape
-
-    output_size = get_conv_output_size((1, 1, 512, 16), conv_layers)
-    print(f"Output size after conv layers: {output_size}")
-
-    # Use the calculated size for the fully connected layer input
-    fc_layers = [
-        [nn.Linear(output_size[1] * output_size[2] * output_size[3], 4), nn.ReLU()],
-        [nn.Linear(4, 1), None]
-    ]
-
-    zero_model = Zero_PulseClassifier(conv_layers, fc_layers)
-    autoencoder.to(device)
-    state_dict = torch.load(best_autoencoder_model_path, map_location=device)
-    autoencoder.load_state_dict(state_dict)
-
-    zero_model.to(device)
-    state_dict = torch.load(best_model_zero_mask_path, map_location=device)
-    print(state_dict.keys())
-    # Remove keys related to side_network
-    keys_to_remove = ['side_network.0.weight', 'side_network.0.bias']
-    state_dict = {k: v for k, v in state_dict.items() if not any(key in k for key in keys_to_remove)}
-
-
-    zero_model.load_state_dict(state_dict)
-
-    identifier = "testLSTM_XimgDenoised"
-
-    if device.type == 'cuda':
-        gpu_name = torch.cuda.get_device_name(0)
-        num_gpus = torch.cuda.device_count()
-        gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)  # Convert to GB
-        gpu_memory_reserved = torch.cuda.memory_reserved(0) / (1024 ** 3)  # Convert to GB
-        gpu_memory_allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)  # Convert to GB
-        device_info = f"{gpu_name} (Total GPUs: {num_gpus}, Total Memory: {gpu_memory_total:.2f} GB, " \
-                    f"Reserved Memory: {gpu_memory_reserved:.2f} GB, Allocated Memory: {gpu_memory_allocated:.2f} GB)"
-    elif device.type == 'mps':
-        device_info = 'MPS (Apple Silicon GPU)'
-    else:
-        device_info = 'CPU'
-
-    print(f"Using device: {device_info}")
-    # classModel.train_model(train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=max_epochs, denoising=False, second_denoising=True, denoise_model =autoencoder , zero_mask_model = zero_model, second_train_dataloader = train_dataloader_2, second_val_dataloader = val_dataloader_2)
-    classModel.train_model(train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=max_epochs, denoising=True, second_denoising=False, denoise_model =autoencoder , zero_mask_model = zero_model)
-
-    results_file = os.path.join(model_save_dir, f"{identifier}_results.txt")
-    # with open(results_file, 'w') as f:
-    #     f.write("Model Training Results\n")
-    #     f.write("======================\n")
-    #     f.write(f"Data Path: {datapath2}\n")
-    #     f.write(f"Model Save Directory: {model_save_dir}\n")
-    #     f.write("\nModel Parameters and Hyperparameters\n")
-    #     f.write("-----------------------------------\n")
-    #     f.write(f"Patience: {scheduler.patience}\n")
-    #     f.write(f"Cooldown: {scheduler.cooldown}\n")
-    #     f.write(f"Learning Rate Reduction Factor: {scheduler.lr_reduction_factor}\n")
-    #     f.write(f"Improvement Percentage: {scheduler.improvement_percentage}\n")
-    #     f.write(f"Initial Learning Rate: {optimizer.param_groups[0]['lr']}\n")
-    #     f.write("\nModel Architecture\n")
-    #     f.write("------------------\n")
-    #     f.write(f"Encoder Layers: {encoder_layers}\n")
-    #     f.write(f"Decoder Layers: {decoder_layers}\n")
-    #     f.write("------------------\n")
-    #     f.write(f"LSTM Architecture: {data}\n")
-    #     f.write("\nAdditional Notes\n")
-    #     f.write("----------------\n")
-    #     f.write("LSTM trained on YPDF making sure images between 0 and 1 (instead of -1 to 1). No denoising on Ypdf. Denoising Ximg.\n")
-
-    with open(results_file, 'w') as f:
-        f.write("Model Training Results\n")
-        f.write("======================\n")
-        f.write(f"Data Path: {datapath_train}\n")
-        f.write(f"Model Save Directory: {model_save_dir}\n")
-        f.write(f"Device Used: {device_info}\n")
-        f.write("\nModel Parameters and Hyperparameters\n")
-        f.write("-----------------------------------\n")
-        f.write(f"Patience: {scheduler.patience}\n")
-        f.write(f"Cooldown: {scheduler.cooldown}\n")
-        f.write(f"Learning Rate Reduction Factor: {scheduler.lr_reduction_factor}\n")
-        f.write(f"Improvement Percentage: {scheduler.improvement_percentage}\n")
-        f.write(f"Initial Learning Rate: {optimizer.param_groups[0]['lr']}\n")
-        f.write(f"Zero Mask Model: {best_model_zero_mask_path}\n")
-        f.write(f"Autoencoder Model: {best_autoencoder_model_path}\n")
-        f.write("\nZero Mask Model Architecture\n")
-        f.write("------------------\n")
-        f.write("Convolutional Layers:\n")
-        for layer in conv_layers:
-            f.write(f"{layer}\n")
-        f.write("Fully Connected Layers:\n")
-        for layer in fc_layers:
-            f.write(f"{layer}\n")
-        f.write("\nAutoencoder Architecture\n")
-        f.write("------------------\n")
-        f.write("Encoder Layers:\n")
-        for layer in encoder_layers:
-            f.write(f"{layer}\n")
-        f.write("Decoder Layers:\n")
-        for layer in decoder_layers:
-            f.write(f"{layer}\n")
-        f.write("\nClassifier Architecture\n")
-        f.write("------------------\n")
-        f.write(f"LSTM Architecture: {data}\n")
-        f.write("\nAdditional Notes\n")
-        f.write("----------------\n")
-        f.write("Training on even distribution but on both Ypdf and Ximg.\n")
-        f.write(f"Total Training Epochs: {max_epochs}\n")
-        f.write(f"Data handled using DataMilking_HalfAndHalf with no pulse handler.\n")
-        f.write(f"Batch Size: {train_dataloader.batch_size}\n")
-        f.write(f"Train Size: {train_size}, Validation Size: {val_size}, Test Size: {test_size}\n")
-        f.write(f"Second Data handled using DataMilking_HalfAndHalf with no pulse handler.\n")
-        f.write(f"Second Batch Size: {train_dataloader_2.batch_size}\n")
-        f.write(f"Second Train Size: {train_size}, Second Validation Size: {val_size}, Second Test Size: {test_size}\n")
-        f.write((summary(autoencoder, input_size=(1, 1, 512, 16))))
-
-    print(f"Training completed. Results saved to {results_file}")
-    
-    
 if __name__ == "__main__":
     main()

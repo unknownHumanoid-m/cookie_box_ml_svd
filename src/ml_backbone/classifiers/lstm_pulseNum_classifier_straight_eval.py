@@ -1,252 +1,238 @@
-from classifiers_util import *
+# -*- coding: utf-8 -*-
+"""
+Evaluate the LSTM pulse-number classifier on 2D SVD h5 files, matching the
+figure format of evaluate_how_many.py so the two classifiers can be compared
+head-to-head.
+
+Loads the metadata-rich checkpoint written by
+lstm_pulseNum_classifier_straight_training.py (state_dict + hyperparameters +
+data spec) and emits `confusion_matrix_for_<id>.png` and `images_for_<id>.png`
+in the same layout as how_many.
+"""
+
+import os
+import argparse
+import random
+import time
+
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
 from lstm_pulseNum_classifier import CustomLSTMClassifier
-# Get the directory of the currently running file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Construct the path to the utils directory relative to the current file's directory
-utils_dir = os.path.abspath(os.path.join(current_dir, '../..', 'ml_backbone'))
-denoise_dir = os.path.abspath(os.path.join(current_dir, '../..', 'denoising'))
-
-sys.path.append(utils_dir)
-sys.path.append(denoise_dir)
 
 
-from ximg_to_ypdf_autoencoder import Ximg_to_Ypdf_Autoencoder, Zero_PulseClassifier
-from utils import DataMilking_Nonfat, DataMilking, DataMilking_SemiSkimmed, DataMilking_HalfAndHalf, DataMilking_MilkCurds
-from utils import CustomScheduler
+def load_h5_for_lstm(paths, input_key, min_pulses, max_pulses):
+    """Same loader used in training — returns TensorDataset with inputs
+    shaped (seq_len=16, feat_dim=512) and integer labels 0..(max-min)."""
+    files = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isfile(p) and p.endswith(".h5"):
+            files.append(p)
+        elif os.path.isdir(p):
+            files.extend(
+                os.path.join(p, n) for n in sorted(os.listdir(p)) if n.endswith(".h5")
+            )
+        else:
+            raise FileNotFoundError(f"Not an .h5 file or directory: {p}")
+    if not files:
+        raise RuntimeError(f"No .h5 files found under {paths}")
 
-# Check if CUDA (GPU support) is available
-if torch.cuda.is_available():
-    print("GPU is available!")
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    device = torch.device("mps")
-    print("MPS is available. Using GPU.")
-else:
-    device = torch.device("cpu")
-    print("MPS is not available. Using CPU.")
-# device = torch.device("cpu")
+    inputs, labels = [], []
+    for path in files:
+        print(f"lstm: reading {path}")
+        with h5py.File(path, "r") as f:
+            for shot in f.keys():
+                grp = f[shot]
+                n = int(grp.attrs["npulses"])
+                if n < min_pulses or n > max_pulses:
+                    continue
+                arr = np.asarray(grp[input_key][()], dtype=np.float32)
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"{path}:{shot} {input_key} has shape {arr.shape}, expected 2D"
+                    )
+                # Match training: (seq_len=16, feat_dim=512).
+                if arr.shape[0] > arr.shape[1]:
+                    arr = arr.T
+                inputs.append(arr)
+                labels.append(n - min_pulses)
+    if not inputs:
+        raise RuntimeError(
+            f"No shots with npulses in [{min_pulses}, {max_pulses}] in {files}"
+        )
+    x = torch.from_numpy(np.stack(inputs))
+    y = torch.tensor(labels, dtype=torch.long)
+    return TensorDataset(x, y), x.shape[1], x.shape[2]
+
+
+def plot_confusion_matrix(cm, save_path, accuracy, elapsed, class_labels):
+    n = cm.shape[0]
+    fig, ax = plt.subplots(figsize=(1.2 * n + 3, 1.0 * n + 3))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.colorbar(im, ax=ax)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(class_labels)
+    ax.set_yticklabels(class_labels)
+    ax.set_xlabel("Predicted # Pulses")
+    ax.set_ylabel("True # Pulses")
+    ax.set_title(f"Confusion Matrix\nAcc: {accuracy:.2f}%  |  Time: {elapsed:.3f}s")
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"Confusion matrix saved to {save_path}")
+
+
 def main():
-    seed = 42
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # Input Data Paths and Output Save Paths
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dirs", type=str, required=True,
+                        help="':'-separated list of h5 files or directories.")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Path to the trained .pth (from the training script).")
+    parser.add_argument("--input_key", type=str, default=None,
+                        help="Override the input_key stored in the checkpoint.")
+    parser.add_argument("--min_pulses", type=int, default=None)
+    parser.add_argument("--max_pulses", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--figures_dir", type=str, default=None)
+    parser.add_argument("--identifier", type=str, default=None,
+                        help="Prefix for output figure filenames. "
+                             "Defaults to the .pth basename (no extension).")
+    args = parser.parse_args()
 
-    # Load Dataset and Feed to Dataloader
-    # datapath = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    datapath1 = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_06252024/"
-    datapath2 = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_06252024/"
-    datapath_train = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024/train/"
-    datapath_val = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024/val/"
-    datapath_test = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024_0to1/test/"
-    # datapath_test = "/sdf/data/lcls/ds/prj/prjs2e21/results/2-Pulse_04232024/Processed_07312024_0to1/test/"
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
 
-    pulse_specification = None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
+    ckpt = torch.load(args.model_path, map_location=device)
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise RuntimeError(
+            f"{args.model_path} is not a straight_training checkpoint "
+            f"(expected dict with 'state_dict' + metadata)."
+        )
 
-    # data = DataMilking_Nonfat(root_dir=datapath, pulse_number=2, subset=4)
-    # data = DataMilking_SemiSkimmed(root_dir=datapath, pulse_number=1, input_name="Ximg", labels=["Ypdf"])
-    # data_test = DataMilking_MilkCurds(root_dirs=[datapath_test], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, test_batch=1, zero_to_one_rescale=True)
-    # data_test = DataMilking_MilkCurds(root_dirs=[datapath_test], input_name="Ximg", pulse_handler=None, transform=None, pulse_threshold=4, test_batch=1, zero_to_one_rescale=False)
-   
-    # data_test = DataMilking_MilkCurds(root_dirs=[datapath_test], input_name="Ximg", pulse_handler=None, transform=None, pulse_threshold=4, zero_to_one_rescale=False, test_batch=1)
-    data_test = DataMilking_MilkCurds(root_dirs=[datapath_test], input_name="Ximg", pulse_handler=None, transform=None, pulse_threshold=5, zero_to_one_rescale=False, phases_labeled=False, phases_labeled_max=2)
+    input_key = args.input_key or ckpt["input_key"]
+    min_pulses = args.min_pulses if args.min_pulses is not None else ckpt["min_pulses"]
+    max_pulses = args.max_pulses if args.max_pulses is not None else ckpt["max_pulses"]
+    seq_len = int(ckpt["seq_len"])
+    feat_dim = int(ckpt["feat_dim"])
+    num_classes = int(ckpt["num_classes"])
 
+    print(f"input_key={input_key}, npulses range=[{min_pulses}, {max_pulses}], "
+          f"seq_len={seq_len}, feat_dim={feat_dim}, num_classes={num_classes}")
 
-
-    # data_val = DataMilking_MilkCurds(root_dirs=[datapath_val], input_name="Ypdf", pulse_handler=None, transform=None, pulse_threshold=4, test_batch=3)
-
-    # Calculate the lengths for each split
-    train_size = 0
-    val_size = 0
-    test_size = len(data_test) - train_size - val_size
-    #print sizes of train, val, and test
-    print(f"Train size: {train_size}")
-    print(f"Validation size: {val_size}")
-    print(f"Test size: {test_size}")
-
-    # Perform the split
-    train_dataset, val_dataset, test_dataset = random_split(data_test, [train_size, val_size, test_size])
-
-
-    # Create data loaders
-    # train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    # val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-
-    # Define the model
-    # Create CustomLSTMClassifier model
-    # data = {
-    #     "hidden_size": 64,
-    #     "num_lstm_layers": 3,
-    #     "bidirectional": True,
-    #     "fc_layers": [32, 64],
-    #     "dropout": 0.2,
-    #     "lstm_dropout": 0.2,
-    #     "layerNorm": False,
-    #     # Other parameters are default or not provided in the example
-    # }   
-    data = {
-        "hidden_size": 128,#128
-        "num_lstm_layers": 3,
-        "bidirectional": True,
-        "fc_layers": [32, 64],
-        "dropout": 0.2,
-        "lstm_dropout": 0.2,
-        "layerNorm": False,
-        # Other parameters are default or not provided in the example
-    }   
-
-    # Assuming input_size and num_classes are defined elsewhere
-    input_size = 512  # Define your input size
-    num_classes = 6   # Example number of classes
-
-    # Instantiate the CustomLSTMClassifier
-    classModel = CustomLSTMClassifier(
-        input_size=input_size,
-        hidden_size=data['hidden_size'],
-        num_lstm_layers=data['num_lstm_layers'],
+    model = CustomLSTMClassifier(
+        input_size=feat_dim,
+        hidden_size=int(ckpt["hidden_size"]),
+        num_lstm_layers=int(ckpt["num_lstm_layers"]),
         num_classes=num_classes,
-        bidirectional=data['bidirectional'],
-        fc_layers=data['fc_layers'],
-        dropout_p=data['dropout'],
-        lstm_dropout=data['lstm_dropout'],
-        layer_norm=data['layerNorm'],
-        ignore_output_layer=False  # Set as needed based on your application
+        bidirectional=True,
+        fc_layers=[32, 64],
+        dropout_p=float(ckpt["dropout"]),
+        lstm_dropout=float(ckpt["lstm_dropout"]),
+        layer_norm=False,
+        ignore_output_layer=False,
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    data_paths = [d for d in args.data_dirs.split(":") if d]
+    test_dataset, ds_seq, ds_feat = load_h5_for_lstm(
+        data_paths, input_key, min_pulses, max_pulses,
     )
-    classModel.to(device)
+    if (ds_seq, ds_feat) != (seq_len, feat_dim):
+        raise RuntimeError(
+            f"Test data shape (seq_len={ds_seq}, feat_dim={ds_feat}) "
+            f"does not match the checkpoint (seq_len={seq_len}, feat_dim={feat_dim})."
+        )
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                             shuffle=False, num_workers=args.num_workers)
 
-        # model_save_dir = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_073312024_5classCase/evalOutput_5classCase_temp"
-    # Check if directory exists, otherwise create it
-    if not os.path.exists(model_save_dir):
-        os.makedirs(model_save_dir)
+    start_time = time.time()
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device, torch.float32)
+            y = y.to(device)
+            logits = model(x)
+            preds = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+            all_preds.append(preds.cpu())
+            all_labels.append(y.cpu())
+    elapsed = time.time() - start_time
+    accuracy = 100.0 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
+    print(f"Time to evaluate test cases: {elapsed:.3f}s")
 
+    all_preds = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    cm = np.zeros((num_classes, num_classes), dtype=int)
+    for t, p in zip(all_labels, all_preds):
+        cm[t, p] += 1
 
+    identifier = args.identifier or os.path.splitext(os.path.basename(args.model_path))[0]
+    figures_dir = args.figures_dir or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "figures"
+    )
+    os.makedirs(figures_dir, exist_ok=True)
 
+    class_labels = [str(min_pulses + i) for i in range(num_classes)]
+    cm_path = os.path.join(figures_dir, f"confusion_matrix_for_{identifier}.png")
+    plot_confusion_matrix(cm, cm_path, accuracy, elapsed, class_labels)
 
-    # best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_06272024_singlePulse/testAutoencoder_best_model.pth"
-    # best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_singlePulse_2/autoencoder_best_model.pth"
-    best_autoencoder_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07282024_multiPulse/autoencoder_best_model.pth"
+    # --------------------------------------------------------------------
+    # Sample visualization: images with true/pred pulse counts.
+    # Stored as (16, 512); display as-is to match evaluate_how_many.py.
+    # --------------------------------------------------------------------
+    num_samples = min(12, len(test_dataset))
+    ncols = 4
+    nrows = (num_samples + ncols - 1) // ncols
+    indices = random.sample(range(len(test_dataset)), num_samples)
 
-    
-    best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_zeroPredict/classifier_best_model.pth"
+    fig, axs = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+    axs = np.atleast_2d(axs).ravel()
+    fig.suptitle(
+        f"LSTM Pulse-Number Classifier | input_key={input_key} "
+        f"| Test Acc: {accuracy:.2f}% | Time: {elapsed:.3f}s "
+        f"| npulses {min_pulses}..{max_pulses}",
+        fontsize=14,
+    )
+    for i, idx in enumerate(indices):
+        x, label = test_dataset[idx]
+        with torch.no_grad():
+            logits = model(x.unsqueeze(0).to(device, torch.float32))
+        true_pulses = int(label.item()) + min_pulses
+        pred_pulses = int(logits.argmax(dim=1).cpu().item()) + min_pulses
+        # x is already (16, 512) — display as-is.
+        axs[i].imshow(x.numpy(), aspect="auto", cmap="magma_r")
+        axs[i].axis("off")
+        axs[i].set_title(f"True: {true_pulses}\nPred: {pred_pulses}")
+    for ax in axs[num_samples:]:
+        ax.axis("off")
 
-    # best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07042024_zeroPredict/classifier_best_model.pth"
-    # best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_zeroPredict/classifier_best_model.pth"
-
-    # best_mode_classifier = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_07262024_ypdf_0to1_4/testLSTM_best_model.pth"
-    # best_mode_classifier = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_07262024_ypdf_0to1_5_extraClass/testLSTM_best_model.pth"
-    # best_mode_classifier = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_07302024_ypdf_0to1_test3/testLSTM_best_model.pth"
-    best_mode_classifier = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/lstm_classifier/run_073312024_5classCase/testLSTM_best_model.pth"
-    state_dict = torch.load(best_mode_classifier, map_location=device)
-    def remove_module_prefix(state_dict):
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
-            else:
-                new_state_dict[k] = v
-        return new_state_dict
-    state_dict = remove_module_prefix(state_dict)
-    for key in state_dict.keys():
-        print(key, state_dict[key].shape)
-    classModel.load_state_dict(state_dict)
-
-    # Example usage
-    encoder_layers = np.array([
-        [nn.Conv2d(1, 16, kernel_size=3, padding=2), nn.ReLU()],
-        [nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU()]])
-   
-    # decoder_layers = np.array([
-    #     [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Tanh()]  # Example with Sigmoid activation
-    #     # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
-    # ])
-    decoder_layers = np.array([
-        [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Sigmoid()]  # Example with Sigmoid activation
-        # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
-    ])
-    
-    autoencoder = Ximg_to_Ypdf_Autoencoder(encoder_layers, decoder_layers)
-
-    # Example usage
-    conv_layers = [
-        [nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None],
-        [nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None]
-    ]
-
-    # Calculate the output size after conv layers
-    def get_conv_output_size(input_size, conv_layers):
-        x = torch.randn(input_size)
-        model = nn.Sequential(*[layer for layer_pair in conv_layers for layer in layer_pair if layer is not None])
-        x = model(x)
-        return x.shape
-
-    output_size = get_conv_output_size((1, 1, 512, 16), conv_layers)
-    print(f"Output size after conv layers: {output_size}")
-
-    # Use the calculated size for the fully connected layer input
-    fc_layers = [
-        [nn.Linear(output_size[1] * output_size[2] * output_size[3], 4), nn.ReLU()],
-        [nn.Linear(4, 1), None]
-    ]
-
-    zero_model = Zero_PulseClassifier(conv_layers, fc_layers)
-    autoencoder.to(device)
-    state_dict = torch.load(best_autoencoder_model_path, map_location=device)
-    autoencoder.load_state_dict(state_dict)
-
-    zero_model.to(device)
-    state_dict = torch.load(best_model_zero_mask_path, map_location=device)
-    print(state_dict.keys())
-    # Remove keys related to side_network
-    keys_to_remove = ['side_network.0.weight', 'side_network.0.bias']
-    state_dict = {k: v for k, v in state_dict.items() if not any(key in k for key in keys_to_remove)}
+    plt.tight_layout()
+    fig_path = os.path.join(figures_dir, f"images_for_{identifier}.png")
+    plt.savefig(fig_path)
+    print(f"Evaluation figure saved to {fig_path}")
 
 
-    zero_model.load_state_dict(state_dict)
-
-    identifier = "testLSTM"
-    autoencoder.to(device)
-    zero_model.to(device)
-
-    # Calculate the total number of parameters
-    total_params = sum(param.numel() for param in classModel.parameters())
-
-    print(f'Total number of parameters: {total_params}')
-    classModel.evaluate_model(test_dataloader, identifier, model_save_dir, device, denoising=True, denoise_model = autoencoder, zero_mask_model = zero_model, two_pulse_analysis=False)
-    
-    
-    # results_file = os.path.join(model_save_dir, f"{identifier}_results.txt")
-    # with open(results_file, 'w') as f:
-    #     f.write("Model Training Results\n")
-    #     f.write("======================\n")
-    #     f.write(f"Data Path: {datapath2}\n")
-    #     f.write(f"Model Save Directory: {model_save_dir}\n")
-    #     f.write("\nModel Parameters and Hyperparameters\n")
-    #     f.write("-----------------------------------\n")
-    #     f.write(f"Patience: {scheduler.patience}\n")
-    #     f.write(f"Cooldown: {scheduler.cooldown}\n")
-    #     f.write(f"Learning Rate Reduction Factor: {scheduler.lr_reduction_factor}\n")
-    #     f.write(f"Improvement Percentage: {scheduler.improvement_percentage}\n")
-    #     f.write(f"Initial Learning Rate: {optimizer.param_groups[0]['lr']}\n")
-    #     f.write("\nModel Architecture\n")
-    #     f.write("------------------\n")
-    #     f.write(f"Encoder Layers: {encoder_layers}\n")
-    #     f.write(f"Decoder Layers: {decoder_layers}\n")
-    #     f.write("\nAdditional Notes\n")
-    #     f.write("----------------\n")
-    #     f.write("First trial on S3DF for LSTM trained on denoised data.\n")
-
-    
-    
 if __name__ == "__main__":
     main()

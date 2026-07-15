@@ -192,16 +192,21 @@ class DataMilking_HalfAndHalf(Dataset):
         self.labels_arr = []
         self.test_batch = test_batch
 
-        
+
         for i, root_dir in enumerate(self.root_dirs):
-            train_files = os.listdir(root_dir)
-            train_files = list(filter(lambda x: x.endswith('.h5'), train_files))
+            if os.path.isfile(root_dir) and root_dir.endswith('.h5'):
+                base_dir = os.path.dirname(root_dir)
+                train_files = [os.path.basename(root_dir)]
+            else:
+                base_dir = root_dir
+                train_files = os.listdir(root_dir)
+                train_files = list(filter(lambda x: x.endswith('.h5'), train_files))
             if self.test_batch is not None:
                 train_files = train_files[:self.test_batch]
 
             for file in train_files:
                 print("file: ", file)
-                with h5py.File(os.path.join(root_dir, file), 'r') as f:
+                with h5py.File(os.path.join(base_dir, file), 'r') as f:
                     for shot in f.keys():
                         # Check if exception
                         if pulse_handler is not None and pulse_handler[i]["pulse_number"] is not None and pulse_handler[i]["pulse_number_max"] is not None:

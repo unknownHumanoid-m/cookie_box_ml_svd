@@ -10,7 +10,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 utils_dir = os.path.abspath(os.path.join(current_dir, '..', 'ml_backbone'))
 
 # Add the utils directory to the Python path
-sys.path.append(utils_dir)
+sys.path.insert(0, utils_dir)
 from utils import DataMilking_Nonfat, DataMilking, DataMilking_SemiSkimmed, DataMilking_HalfAndHalf
 from utils import CustomScheduler
 
@@ -32,26 +32,15 @@ def main():
     np.random.seed(seed)
     # Input Data Paths and Output Save Paths
 
-    # Load Dataset and Feed to Dataloader
-    # datapath = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    # datapath = "/sdf/data/lcls/ds/prj/prjs2e21/results/2-Pulse_04232024/Processed_06212024/"
-    datapath1 = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_06252024/"
-    datapath2 = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_06252024/"
-    datapath_train = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_07262024_0to1/train/"
-    datapath_train = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024_0to1/train/"
-    datapath_train = "/sdf/scratch/lcls/ds/prj/prjs2e21/scratch/fast_data_access/even-dist_Pulses_03302024/Processed_07262024_0to1/train/"
+    # 2D SVD dataset (rank-r reconstruction, same 2D shape as original).
+    # Training data directory (or ':'-separated list of dirs). Override via env
+    # var TRAIN_DATA_DIRS so the user only edits s3df_denoising.sh.
+    default_train_dirs = "/sdf/home/m/miaed/tmo_exp/tmo101347625/scratch/miaed_mnis_data/mrco_h5_svd/"
+    train_dirs_env = os.environ.get("TRAIN_DATA_DIRS", default_train_dirs)
+    datapaths = [d for d in train_dirs_env.split(":") if d]
+    print(f"Training on data dirs: {datapaths}")
 
-    # datapaths = [datapath2, datapath2]
-    # pulse_specification = [{"pulse_number": 1, "pulse_number_max": None}, {"pulse_number": 0, "pulse_number_max": None}]
-
-    datapaths = [datapath_train]
-    pulse_specification = [{"pulse_number": 1, "pulse_number_max": None}]
-    pulse_specification = [{"pulse_number": None, "pulse_number_max": 10}]
-
-    # data = DataMilking_Nonfat(root_dir=datapath, pulse_number=2, subset=4)
-    # data = DataMilking_SemiSkimmed(root_dir=datapath, pulse_number=1, input_name="Ximg", labels=["Ypdf"])
-    # data = DataMilking_HalfAndHalf(root_dirs=datapaths, pulse_handler = pulse_specification, input_name="Ximg", labels=["Ypdf"],transform=None)
-    data = DataMilking_HalfAndHalf(root_dirs=datapaths, pulse_handler = None, input_name="Ximg", labels=["Ypdf"],transform=None)
+    data = DataMilking_HalfAndHalf(root_dirs=datapaths, pulse_handler=None, input_name="Ximg", labels=["Ypdf"], transform=None)
 
     print(len(data))
     # Calculate the lengths for each split
@@ -92,7 +81,6 @@ def main():
         # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
     ])
 
-
     autoencoder = Ximg_to_Ypdf_Autoencoder(encoder_layers, decoder_layers)
 
     # Define the loss function and optimizer
@@ -100,17 +88,22 @@ def main():
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=0.0005)
     max_epochs = 200
     scheduler = CustomScheduler(optimizer, patience=5, early_stop_patience = 9, cooldown=2, lr_reduction_factor=0.5, max_num_epochs = max_epochs, improvement_percentage=0.001)
-    # model_save_dir = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    # model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07032024_singlePulseAndZeroPulse_ErrorWeighted_test/"
-    # model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07282024_multiPulse/"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09042024_multiPulse_final/"
+    # Scratch dir for heavy artifacts (checkpoints, .pth model files, dataset caches, run summaries).
+    # Figures stay next to this .py file under ./figures/ (see below).
+    # Both are overridable via env vars set in s3df_denoising.sh.
+    default_model_save_dir = "/sdf/home/m/miaed/tmo_exp/tmo101347625/scratch/denoising_runs/svd2d_r8_autoencoder/"
+    model_save_dir = os.environ.get("MODEL_SAVE_DIR", default_model_save_dir)
 
+    default_figures_dir = os.path.join(current_dir, "figures")
+    figures_dir = os.environ.get("FIGURES_DIR", default_figures_dir)
 
-    # Check if directory exists, otherwise create it
-    if not os.path.exists(model_save_dir):
-        os.makedirs(model_save_dir)
+    os.makedirs(model_save_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
 
-    identifier = "autoencoder_6"
+    identifier = os.environ.get("MODEL_IDENTIFIER", "autoencoder_svd2d_r8")
+    print(f"Model save dir: {model_save_dir}")
+    print(f"Figures dir:    {figures_dir}")
+    print(f"Identifier:     {identifier}")
     autoencoder.to(device)
     # Get detailed GPU information if using CUDA
     if device.type == 'cuda':
@@ -125,10 +118,10 @@ def main():
         device_info = 'MPS (Apple Silicon GPU)'
     else:
         device_info = 'CPU'
-    print(summary(autoencoder, input_size=(1, 1, 512, 16)))
+    print(summary(autoencoder, input_size=(1, 1, 16, 512)))
 
     print(f"Using device: {device_info}")
-    autoencoder.train_model(train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=max_epochs)
+    autoencoder.train_model(train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=max_epochs, figures_dir=figures_dir)
 
     results_file = os.path.join(model_save_dir, f"{identifier}_results.txt")
     # with open(results_file, 'w') as f:
@@ -173,17 +166,17 @@ def main():
             f.write(f"{layer}\n")
         f.write("\nAdditional Notes\n")
         f.write("----------------\n")
-        f.write("Training on even distribution, max 10 pulses.\n")
+        f.write("Training on 2D SVD (rank-r reconstruction) Ximg -> Ypdf dataset.\n")
         f.write(f"Total Training Epochs: {max_epochs}\n")
         f.write(f"Data handled using DataMilking_HalfAndHalf with no pulse handler.\n")
+        f.write(f"Figures Directory: {figures_dir}\n")
         f.write(f"Batch Size: {train_dataloader.batch_size}\n")
         f.write(f"Train Size: {train_size}, Validation Size: {val_size}, Test Size: {test_size}\n")
-        f.write((summary(autoencoder, input_size=(1, 1, 512, 16))))
+        f.write(str(summary(autoencoder, input_size=(1, 1, 16, 512))))
 
     print(f"Training completed. Results saved to {results_file}")
 
 
-    
 if __name__ == "__main__":
 
     main()

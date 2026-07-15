@@ -1,6 +1,68 @@
 from ximg_to_ypdf_autoencoder import Ximg_to_Ypdf_Autoencoder
 from ximg_to_ypdf_autoencoder import Zero_PulseClassifier
 from denoising_util import *
+
+
+def save_comparison_figures(results_h5_path, figures_dir, identifier, num_examples=6):
+    """Read `num_examples` groups from the eval-results h5 and write a single
+    combined PNG (rows = examples, columns = noisy input / denoised output /
+    truth) into `figures_dir`. Uses aspect='auto' and cmap='magma_r' to match
+    src/data_processing/processed_data_viewer.py.
+    """
+    os.makedirs(figures_dir, exist_ok=True)
+    with h5py.File(results_h5_path, "r") as h5file:
+        group_keys = sorted(h5file.keys())
+        n = min(num_examples, len(group_keys))
+        if n == 0:
+            print(f"No groups found in {results_h5_path}; skipping figure.")
+            return None
+
+        col_titles = ("Noisy Input (Ximg)", "Denoised Output", "Truth (Ypdf)")
+
+        examples = []
+        for key in group_keys[:n]:
+            grp = h5file[key]
+            examples.append((
+                key,
+                np.array(grp["input"]),
+                np.array(grp["output"]),
+                np.array(grp["target"]),
+                grp.attrs.get("loss", float("nan")),
+            ))
+
+        all_vals = np.concatenate(
+            [arr.ravel() for _, inp, out, tgt, _ in examples
+             for arr in (inp, out, tgt)]
+        )
+        vmin, vmax = float(all_vals.min()), float(all_vals.max())
+
+        fig, axes = plt.subplots(
+            n, 3, figsize=(15, 2.5 * n), squeeze=False,
+        )
+
+        im = None
+        for row, (key, inp, out, tgt, loss) in enumerate(examples):
+            for col, (img, title) in enumerate(
+                zip((inp, out, tgt), col_titles)
+            ):
+                ax = axes[row, col]
+                im = ax.imshow(img, aspect="auto", cmap="magma_r",
+                               vmin=vmin, vmax=vmax)
+                if row == 0:
+                    ax.set_title(title)
+            axes[row, 0].set_ylabel(f"{key}\nMSE={loss:.2e}")
+
+        fig.suptitle(f"{identifier} — input vs. denoised vs. truth ({n} examples)")
+        fig.tight_layout(rect=[0, 0, 0.92, 0.96])
+        cbar_ax = fig.add_axes([0.94, 0.08, 0.015, 0.84])
+        fig.colorbar(im, cax=cbar_ax)
+
+        out_path = os.path.join(figures_dir, f"{identifier}_comparison.png")
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"Wrote combined comparison figure: {out_path}")
+        return out_path
+
 # Get the directory of the currently running file
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -8,7 +70,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 utils_dir = os.path.abspath(os.path.join(current_dir, '..', 'ml_backbone'))
 
 # Add the utils directory to the Python path
-sys.path.append(utils_dir)
+sys.path.insert(0, utils_dir)
 from utils import DataMilking_Nonfat, DataMilking, DataMilking_SemiSkimmed, DataMilking_HalfAndHalf
 from utils import CustomScheduler
 
@@ -22,148 +84,161 @@ elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
 else:
     device = torch.device("cpu")
     print("MPS is not available. Using CPU.")
-# device = torch.device("cpu")
+
 def main():
     seed = 42
     torch.manual_seed(seed)
     np.random.seed(seed)
-    # Input Data Paths and Output Save Paths
 
-    # Load Dataset and Feed to Dataloader
-    # datapath = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    # datapath = "/sdf/data/lcls/ds/prj/prjs2e21/results/2-Pulse_04232024/Processed_06212024/"
-    # datapath = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_06252024/"
-    datapath_test = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_07262024_0to1/test/"
-    datapath_test = "/sdf/scratch/lcls/ds/prj/prjs2e21/scratch/fast_data_access/even-dist_Pulses_03302024/Processed_07262024_0to1/test/"
-    datapath= datapath_test
-    # datapath = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_06252024/"
-    # dataset = DataMilking(root_dir=datapath, attributes=["energies", "phases", "npulses"], pulse_number=2)
+    # ----------------------------------------------------------------------
+    # Config (overridable from s3df_denoising.sh via env vars).
+    # ----------------------------------------------------------------------
+    # Test data dir(s). ':'-separated list allowed.
+    default_eval_dirs = "/sdf/home/m/miaed/tmo_exp/tmo101347625/scratch/miaed_mnis_data/mrco_h5_svd/"
+    eval_dirs_env = os.environ.get("EVAL_DATA_DIRS", default_eval_dirs)
+    datapaths = [d for d in eval_dirs_env.split(":") if d]
 
-    # datapath1 = "/sdf/data/lcls/ds/prj/prjs2e21/results/1-Pulse_03282024/Processed_06252024/"
-    # datapath2 = "/sdf/data/lcls/ds/prj/prjs2e21/results/even-dist_Pulses_03302024/Processed_06252024/"
-    # datapaths = [datapath1, datapath2]
-    # pulse_specification = [{"pulse_number": 1, "pulse_number_max": None}, {"pulse_number": 0, "pulse_number_max": 10}]
+    # Autoencoder weights to evaluate.
+    default_model_path = (
+        "/sdf/home/m/miaed/tmo_exp/tmo101347625/scratch/denoising_runs/"
+        "svd2d_r8_autoencoder/autoencoder_svd2d_r8_best_model.pth"
+    )
+    best_model_path = os.environ.get("EVAL_MODEL_PATH", default_model_path)
 
+    # Where to write eval results (h5, txt).
+    default_eval_out = (
+        "/sdf/home/m/miaed/tmo_exp/tmo101347625/scratch/denoising_runs/"
+        "svd2d_r8_autoencoder/eval/"
+    )
+    model_save_dir = os.environ.get("EVAL_OUT_DIR", default_eval_out)
 
-    # data = DataMilking_Nonfat(root_dir=datapath, pulse_number=2, subset=4)
-    # data = DataMilking_SemiSkimmed(root_dir=datapath, pulse_number=1, input_name="Ximg", labels=["Ypdf"])
-    # data = DataMilking_HalfAndHalf(root_dirs=datapaths, pulse_handler = pulse_specification, input_name="Ximg", labels=["Ypdf"],transform=None, test_batch=None)
-    data = DataMilking_HalfAndHalf(root_dirs=[datapath_test], pulse_handler = None, test_batch=1, input_name="Ximg", labels=["Ypdf"],transform=None)
+    identifier = os.environ.get("EVAL_IDENTIFIER", "autoencoder_svd2d_r8_eval")
 
-    # data = DataMilking_SemiSkimmed(root_dir=datapath, pulse_number_max=10, input_name="Ximg", labels=["Ypdf"], test_batch=2)
-    # Calculate the lengths for each split
+    default_figures_dir = os.path.join(current_dir, "figures")
+    figures_dir = os.environ.get("EVAL_FIGURES_DIR", default_figures_dir)
+
+    num_comparison_figures = int(os.environ.get("EVAL_NUM_COMPARISON_FIGURES", "6"))
+
+    # Optional zero-pulse classifier. If unset -> zero_masking disabled.
+    classifier_path = os.environ.get("CLASSIFIER_PATH", "").strip()
+    use_zero_masking = bool(classifier_path)
+
+    os.makedirs(model_save_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+
+    print(f"Eval data dirs:     {datapaths}")
+    print(f"Model weights:      {best_model_path}")
+    print(f"Eval output dir:    {model_save_dir}")
+    print(f"Eval identifier:    {identifier}")
+    print(f"Figures dir:        {figures_dir}")
+    print(f"Zero-masking:       {use_zero_masking} ({classifier_path or 'disabled'})")
+
+    # ----------------------------------------------------------------------
+    # Dataset -> test-only DataLoader.
+    # ----------------------------------------------------------------------
+    data = DataMilking_HalfAndHalf(
+        root_dirs=datapaths, pulse_handler=None, test_batch=1,
+        input_name="Ximg", labels=["Ypdf"], transform=None,
+    )
+
     train_size = int(0 * len(data))
     val_size = int(0 * len(data))
     test_size = int(len(data) - train_size - val_size)
 
-    # Perform the split
-    train_dataset, val_dataset, test_dataset = random_split(data, [train_size, val_size, test_size])
-
-     # Create data loaders
-    # train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8)
-    # val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=8)
+    train_dataset, val_dataset, test_dataset = random_split(
+        data, [train_size, val_size, test_size]
+    )
     test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=8)
 
-
-    # Example usage
+    # ----------------------------------------------------------------------
+    # Model (must match the architecture used at training time).
+    # ----------------------------------------------------------------------
     encoder_layers = np.array([
         [nn.Conv2d(1, 16, kernel_size=3, padding=2), nn.ReLU()],
         [nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU()],
         [nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU()]])
-   
-    # decoder_layers = np.array([
-    #     [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-    #     [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Tanh()]  # Example with Sigmoid activation
-    #     # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
-    # ])
+
     decoder_layers = np.array([
         [nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1), nn.ReLU()],
         [nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1), nn.ReLU()],
-        [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Sigmoid()]  # Example with Sigmoid activation
-        # [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), None],  # Example without activation
+        [nn.ConvTranspose2d(16, 1, kernel_size=3, padding=2), nn.Sigmoid()]
     ])
-    
+
     autoencoder = Ximg_to_Ypdf_Autoencoder(encoder_layers, decoder_layers)
-
-    # Example usage
-    conv_layers = [
-        [nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None],
-        [nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1), nn.ReLU()],
-        [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None]
-    ]
-
-    # Calculate the output size after conv layers
-    def get_conv_output_size(input_size, conv_layers):
-        x = torch.randn(input_size)
-        model = nn.Sequential(*[layer for layer_pair in conv_layers for layer in layer_pair if layer is not None])
-        x = model(x)
-        return x.shape
-
-    output_size = get_conv_output_size((1, 1, 512, 16), conv_layers)
-    print(f"Output size after conv layers: {output_size}")
-
-    # Use the calculated size for the fully connected layer input
-    fc_layers = [
-        [nn.Linear(output_size[1] * output_size[2] * output_size[3], 4), nn.ReLU()],
-        [nn.Linear(4, 1), None]
-    ]
-
-    classifier = Zero_PulseClassifier(conv_layers, fc_layers)
-
-    # Define the loss function and optimizer
-    criterion = nn.MSELoss()
-    # model_save_dir = "/Users/jhirschm/Documents/MRCO/Data_Changed/Test"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07282024_multiPulse/outputs_fromEvenDist/"
-    model_save_dir = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09032024_multiPulse_final/outputs_fromEvenDist/"
-    best_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_06272024_singlePulse/testAutoencoder_best_model.pth"
-    best_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07282024_multiPulse/autoencoder_best_model.pth"
-    best_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09022024_multiPulse_final/autoencoder_best_model.pth"
-    best_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_09032024_multiPulse_final/autoencoder_5_best_model.pth"
-    # best_model_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_06302024_singlePulseAndZeroPulse_ErrorWeighted_3/autoencoder_best_model.pth"
-    # best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07042024_zeroPredict/classifier_best_model.pth"
-    best_model_zero_mask_path = "/sdf/data/lcls/ds/prj/prjs2e21/results/COOKIE_ML_Output/denoising/run_07272024_zeroPredict/classifier_best_model.pth"
     autoencoder.to(device)
     state_dict = torch.load(best_model_path, map_location=device)
     autoencoder.load_state_dict(state_dict)
 
-    classifier.to(device)
-    state_dict = torch.load(best_model_zero_mask_path, map_location=device)
-    print(state_dict.keys())
-    # Remove keys related to side_network
-    keys_to_remove = ['side_network.0.weight', 'side_network.0.bias']
-    state_dict = {k: v for k, v in state_dict.items() if not any(key in k for key in keys_to_remove)}
+    # Optional zero-pulse classifier for masking.
+    classifier = None
+    if use_zero_masking:
+        conv_layers = [
+            [nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1), nn.ReLU()],
+            [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None],
+            [nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1), nn.ReLU()],
+            [nn.MaxPool2d(kernel_size=2, stride=2, padding=0), None]
+        ]
 
+        def get_conv_output_size(input_size, conv_layers):
+            x = torch.randn(input_size)
+            model = nn.Sequential(*[layer for layer_pair in conv_layers
+                                    for layer in layer_pair if layer is not None])
+            x = model(x)
+            return x.shape
 
-    classifier.load_state_dict(state_dict)
-    
+        output_size = get_conv_output_size((1, 1, 16, 512), conv_layers)
+        print(f"Output size after conv layers: {output_size}")
 
-    # Check if directory exists, otherwise create it
-    if not os.path.exists(model_save_dir):
-        os.makedirs(model_save_dir)
-    print(summary(autoencoder, input_size=(1, 1, 512, 16)))
+        fc_layers = [
+            [nn.Linear(output_size[1] * output_size[2] * output_size[3], 4), nn.ReLU()],
+            [nn.Linear(4, 1), None]
+        ]
 
-    identifier = "testAutoencoder_eval"
-    autoencoder.evaluate_model(test_dataloader, criterion, device, save_results=True, results_dir=model_save_dir, results_filename=f"{identifier}_results.h5", zero_masking = True, zero_masking_model=classifier)
+        classifier = Zero_PulseClassifier(conv_layers, fc_layers)
+        classifier.to(device)
+        cls_state = torch.load(classifier_path, map_location=device)
+        # Drop side_network keys if present (legacy fine-tuned classifier state).
+        keys_to_remove = ['side_network.0.weight', 'side_network.0.bias']
+        cls_state = {k: v for k, v in cls_state.items()
+                     if not any(key in k for key in keys_to_remove)}
+        classifier.load_state_dict(cls_state)
+
+    criterion = nn.MSELoss()
+    print(summary(autoencoder, input_size=(1, 1, 16, 512)))
+
+    autoencoder.evaluate_model(
+        test_dataloader, criterion, device,
+        save_results=True,
+        results_dir=model_save_dir,
+        results_filename=f"{identifier}_results.h5",
+        zero_masking=use_zero_masking,
+        zero_masking_model=classifier,
+    )
+
+    results_h5_path = os.path.join(model_save_dir, f"{identifier}_results.h5")
+    save_comparison_figures(
+        results_h5_path, figures_dir, identifier,
+        num_examples=num_comparison_figures,
+    )
+
     results_file = os.path.join(model_save_dir, f"{identifier}_results.txt")
     with open(results_file, 'w') as f:
-        f.write("Model Training Results\n")
-        f.write("======================\n")
-        f.write(f"Data Path: {datapath}\n")
+        f.write("Model Evaluation Results\n")
+        f.write("========================\n")
+        f.write(f"Data Paths: {datapaths}\n")
+        f.write(f"Model Weights: {best_model_path}\n")
         f.write(f"Model Save Directory: {model_save_dir}\n")
-        f.write("\nModel Parameters and Hyperparameters\n")
-        f.write("-----------------------------------\n")
+        f.write(f"Figures Directory: {figures_dir}\n")
+        f.write(f"Zero-masking: {use_zero_masking} ({classifier_path or 'disabled'})\n")
         f.write("\nModel Architecture\n")
         f.write("------------------\n")
         f.write(f"Encoder Layers: {encoder_layers}\n")
         f.write(f"Decoder Layers: {decoder_layers}\n")
         f.write("\nAdditional Notes\n")
         f.write("----------------\n")
-        f.write("Results for inspection on test. Running on even pulses but trained on 1 pulse. Max 10 pulses.\n")
-        f.write((summary(autoencoder, input_size=(1, 1, 512, 16))))
+        f.write("Evaluation of 2D SVD (rank-r reconstruction) Ximg -> Ypdf autoencoder.\n")
+        f.write(str(summary(autoencoder, input_size=(1, 1, 16, 512))))
 
-    
-    
+
 if __name__ == "__main__":
     main()

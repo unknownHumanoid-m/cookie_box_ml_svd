@@ -402,13 +402,17 @@ class Ximg_to_Ypdf_Autoencoder(nn.Module):
                 param.requires_grad = True
     
 
-    def train_model(self, train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=10):
+    def train_model(self, train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, checkpoints_enabled=True, resume_from_checkpoint=False, max_epochs=10, figures_dir=None):
         self.to(device)
         train_losses = []
         val_losses = []
         best_val_loss = float('inf')
         best_epoch = 0
         start_epoch = 0
+
+        if figures_dir is None:
+            figures_dir = model_save_dir
+        os.makedirs(figures_dir, exist_ok=True)
 
         checkpoint_path = os.path.join(model_save_dir, f"{identifier}_checkpoint.pth")
 
@@ -428,7 +432,7 @@ class Ximg_to_Ypdf_Autoencoder(nn.Module):
         name = f"{model_save_dir}/{identifier}"+"_run_time_info.txt"
         with open(name, "a") as f:
             f.write(f"Training resumed at {datetime.datetime.now()} from epoch {start_epoch}\n" if start_epoch > 0 else f"Training started at {datetime.datetime.now()}\n")
-            
+
 
             for epoch in range(max_epochs):
                 self.train()  # Set the model to training mode
@@ -544,7 +548,7 @@ class Ximg_to_Ypdf_Autoencoder(nn.Module):
         plt.ylabel('Loss')
         plt.title('Training and Validation Loss')
         plt.legend()
-        losses_path = os.path.join(model_save_dir, identifier + "_losses.pdf")
+        losses_path = os.path.join(figures_dir, identifier + "_losses.pdf")
         plt.savefig(losses_path)
         plt.close()
 
@@ -611,9 +615,13 @@ class Ximg_to_Ypdf_Autoencoder(nn.Module):
 
         return avg_loss
 
-    def fine_tune(self, train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, encoder_layer_indices_unfreeze, decoder_layer_indices_unfreeze, initial_weights_path, max_epochs=10, gradient_clipping_value=0.01, learning_rate_scale=0.1):
+    def fine_tune(self, train_dataloader, val_dataloader, criterion, optimizer, scheduler, model_save_dir, identifier, device, encoder_layer_indices_unfreeze, decoder_layer_indices_unfreeze, initial_weights_path, max_epochs=10, gradient_clipping_value=0.01, learning_rate_scale=0.1, figures_dir=None):
         self.to(device)
         self.load_state_dict(torch.load(initial_weights_path, map_location=device))
+
+        if figures_dir is None:
+            figures_dir = model_save_dir
+        os.makedirs(figures_dir, exist_ok=True)
     
         # Freeze all layers
         self.freeze_all_layers()
@@ -734,7 +742,7 @@ class Ximg_to_Ypdf_Autoencoder(nn.Module):
         plt.ylabel('Loss')
         plt.title('Training and Validation Loss')
         plt.legend()
-        losses_path = os.path.join(model_save_dir, identifier + "_fine_tuning_losses.pdf")
+        losses_path = os.path.join(figures_dir, identifier + "_fine_tuning_losses.pdf")
         plt.savefig(losses_path)
         plt.close()
 
